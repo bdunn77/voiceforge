@@ -122,3 +122,51 @@ def test_video_rejects_undecodable_image(monkeypatch):
     })
     assert response.status_code==400
     assert response.get_json()["error"]=="Face image could not be decoded."
+
+def test_python_tool_uses_console_sibling_for_pythonw(monkeypatch, tmp_path):
+    pythonw=tmp_path/"pythonw.exe";pythonw.write_bytes(b"")
+    python=tmp_path/"python.exe";python.write_bytes(b"")
+    monkeypatch.setattr(vf.os,"name","nt")
+    monkeypatch.setattr(vf.sys,"executable",str(pythonw))
+    monkeypatch.delattr(vf.sys,"frozen",raising=False)
+    assert vf._python_tool_executable()==str(python)
+
+
+def test_python_tool_keeps_current_executable_without_console_sibling(monkeypatch, tmp_path):
+    pythonw=tmp_path/"PythonW.EXE";pythonw.write_bytes(b"")
+    monkeypatch.setattr(vf.os,"name","nt")
+    monkeypatch.setattr(vf.sys,"executable",str(pythonw))
+    monkeypatch.delattr(vf.sys,"frozen",raising=False)
+    assert vf._python_tool_executable()==str(pythonw)
+
+
+def test_python_tool_is_unchanged_off_windows(monkeypatch):
+    monkeypatch.setattr(vf.os,"name","posix")
+    monkeypatch.setattr(vf.sys,"executable","/usr/bin/python3")
+    assert vf._python_tool_executable()=="/usr/bin/python3"
+
+
+
+def test_python_tool_does_not_rewrite_frozen_executable(monkeypatch, tmp_path):
+    pythonw=tmp_path/"pythonw.exe";pythonw.write_bytes(b"")
+    (tmp_path/"python.exe").write_bytes(b"")
+    monkeypatch.setattr(vf.os,"name","nt")
+    monkeypatch.setattr(vf.sys,"executable",str(pythonw))
+    monkeypatch.setattr(vf.sys,"frozen",True,raising=False)
+    assert vf._python_tool_executable()==str(pythonw)
+
+
+def test_lipsync_launch_uses_resolved_python(monkeypatch, tmp_path):
+    image=tmp_path/"upload.png";image.write_bytes(b"image")
+    calls=[]
+    monkeypatch.setattr(vf,"_python_tool_executable",lambda:"console-python.exe")
+    monkeypatch.setattr(vf,"venice_speech",lambda *a:b"wave")
+    monkeypatch.setattr(vf,"tool",lambda name:name)
+    monkeypatch.setattr(vf,"run",lambda cmd,**kw:calls.append((cmd,kw)) or vf.subprocess.CompletedProcess(cmd,0,"",""))
+    monkeypatch.setattr(vf.os.path,"isfile",lambda path: path.endswith("out.mp4") or os.path.isfile(path))
+    monkeypatch.setattr(vf.os.path,"getsize",lambda path: 1)
+    row={"voice_id":"voice"}
+    vf._render_video(row,"hello","1",True,False,str(image),str(tmp_path))
+    lipsync=[call for call in calls if "inference.py" in call[0][1]][0]
+    assert lipsync[0][0]=="console-python.exe"
+    assert lipsync[1]["cwd"]==vf.LS_REPO
