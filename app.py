@@ -148,6 +148,18 @@ def _silent_kw(kw):
     return kw
 
 
+def _python_tool_executable():
+    """Use console Python for child scripts so Windows workers can spawn reliably."""
+    executable = sys.executable
+    if os.name == "nt" and not getattr(sys, "frozen", False):
+        directory, name = os.path.split(executable)
+        if name.casefold() == "pythonw.exe":
+            console_python = os.path.join(directory, "python.exe")
+            if os.path.isfile(console_python):
+                return console_python
+    return executable
+
+
 def run(cmd, **kw):
     r = subprocess.run(cmd, capture_output=True, text=True, **_silent_kw(kw))
     if r.returncode != 0:
@@ -512,14 +524,14 @@ def _render_video(row, text, speed, use_ls, use_hq, image_path, tmpdir, job=None
     out = os.path.join(tmpdir, "out.mp4")
     if use_ls:
         if job: _update_job(job, "lipsync", "Animating the mouth to match speech", 25)
-        cmd=[sys.executable, os.path.join(LS_REPO, "inference.py"), "--checkpoint_path", LS_CKPT,
+        cmd=[_python_tool_executable(), os.path.join(LS_REPO, "inference.py"), "--checkpoint_path", LS_CKPT,
              "--face", img, "--audio", wav, "--outfile", out]
         _run_video_process(job, cmd, timeout=14400, cwd=LS_REPO) if job else run(cmd, timeout=14400, cwd=LS_REPO)
         if job: _update_job(job, "lipsync", "Lip-sync complete", 70)
         if use_hq:
             if job: _update_job(job, "enhance", "Restoring facial detail frame by frame", 72)
             enhanced=os.path.join(tmpdir,"out_enhanced.mp4"); env=os.environ.copy();env["VOICEFORGE_GFP_WEIGHTS"]=LS_GFP
-            cmd=[sys.executable,LS_ENHANCE,out,enhanced]
+            cmd=[_python_tool_executable(),LS_ENHANCE,out,enhanced]
             if job: _run_video_process(job,cmd,timeout=14400,cwd=BASE_DIR,env=env)
             else:
                 result=subprocess.run(cmd,capture_output=True,text=True,timeout=14400,cwd=BASE_DIR,shell=False,env=env,**_silent_kw({}))
