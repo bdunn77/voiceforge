@@ -1,0 +1,9 @@
+name: Bug report
+description: Report a reproducible VoiceForge problem
+body:
+  - type: markdown
+    attributes: {value: 'Never paste API keys, private voice handles, or personal media.'}
+  - type: textarea
+    id: problem
+    attributes: {label: Problem, description: 'What happened and what did you expect?'}
+    validations: {required: true}

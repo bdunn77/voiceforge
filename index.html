@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoiceForge</title>
+<style>
+:root{--bg:#0f1115;--card:#181b21;--line:#2a2f3a;--txt:#e6e9ef;--dim:#9aa3b2;--acc:#7c5cff;--acc2:#22c55e;--err:#ef4444}
+*{box-sizing:border-box}body{margin:0;font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--txt)}
+.wrap{max-width:900px;margin:0 auto;padding:24px}
+h1{font-size:26px;margin:0 0 4px}.sub{color:var(--dim);font-size:13px;margin-bottom:20px}
+.tabs{display:flex;gap:6px;border-bottom:1px solid var(--line);margin-bottom:20px}
+.tab{padding:10px 16px;cursor:pointer;color:var(--dim);border-bottom:2px solid transparent;font-weight:600}
+.tab.on{color:var(--txt);border-color:var(--acc)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+label{display:block;font-size:12px;color:var(--dim);margin:10px 0 5px;text-transform:uppercase;letter-spacing:.5px}
+input,textarea{width:100%;background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--txt);font-size:14px}
+textarea{min-height:110px;resize:vertical}
+button{background:var(--acc);border:0;color:#fff;padding:11px 18px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;margin-top:14px}
+button:hover{filter:brightness(1.15)}button:disabled{opacity:.5;cursor:not-allowed}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--dim)}
+button.danger{background:transparent;border:1px solid var(--err);color:var(--err);padding:6px 10px;font-size:12px;margin-top:0}
+.msg{margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;display:none}
+.msg.ok{display:block;background:rgba(34,197,94,.12);color:var(--acc2)}
+.msg.err{display:block;background:rgba(239,68,68,.12);color:var(--err)}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.25);border-top-color:var(--acc);border-radius:50%;animation:vfspin .8s linear infinite;margin-right:8px;vertical-align:-2px}
+@keyframes vfspin{to{transform:rotate(360deg)}}
+.elapsed{color:var(--dim);font-size:12px;margin-left:6px}
+.voice-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px;background:#12151a}
+.voice-name{font-weight:600}.voice-id{font-size:11px;color:var(--dim);font-family:monospace}
+select{width:100%;background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--txt)}
+audio{width:100%;margin-top:14px}
+.row2{display:flex;gap:10px}.row2>div{flex:1}
+.hint{font-size:12px;color:var(--dim);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>&#127908; VoiceForge</h1>
+<div class="sub">Local voice cloning &amp; TTS studio &middot; everything stays on your machine</div>
+
+<div class="tabs">
+<div class="tab on" data-tab="clone" onclick="tab('clone')">1. Clone</div>
+<div class="tab" data-tab="voices" onclick="tab('voices')">2. My Voices</div>
+<div class="tab" data-tab="generate" onclick="tab('generate')">3. Generate</div>
+<div class="tab" data-tab="video" onclick="tab('video')">4. Make a Video</div>
+<div class="tab" data-tab="settings" onclick="tab('settings')">Settings</div>
+</div>
+
+<!-- CLONE -->
+<div id="pane-clone">
+<div class="card">
+<label>Voice source</label>
+<div class="row2">
+<div><label>YouTube link</label><input id="yt-url" placeholder="https://youtube.com/watch?v=..."></div>
+<div style="max-width:220px"><label>&mdash; or &mdash;</label><input type="file" id="file-input" accept="audio/*,video/*"></div>
+</div>
+<div class="row2">
+<div><label>Trim start (seconds, optional)</label><input id="trim-start" type="number" min="0" step="1" placeholder="auto"></div>
+<div><label>Clip length (seconds, optional)</label><input id="trim-len" type="number" min="5" max="120" step="1" placeholder="up to 90s"></div>
+</div>
+<div class="hint">Tip: a short clean clip of one person speaking gives the best clone. Leave trim empty to auto-detect.</div>
+<button id="btn-clone" onclick="doClone()">Clone voice</button>
+<label>Name this voice (after cloning)</label>
+<input id="voice-name" placeholder="e.g. My Narration Voice">
+<button id="btn-save" onclick="saveVoice()" disabled>Save to my voices</button>
+<div id="msg-clone" class="msg"></div>
+</div>
+</div>
+
+<!-- VOICES -->
+<div id="pane-voices" style="display:none">
+<div class="card">
+<label>Saved voices</label>
+<div id="voice-list"><div class="hint">No voices yet.</div></div>
+<button class="ghost" onclick="loadVoices()">Refresh</button>
+</div>
+</div>
+
+<!-- GENERATE -->
+<div id="pane-generate" style="display:none">
+<div class="card">
+<label>Voice</label><select id="gen-voice"><option value="">-- pick a saved voice --</option></select>
+<label>Text to speak</label><textarea id="gen-text" placeholder="Type anything..."></textarea>
+<div class="row2">
+<div><label>Speed (0.5 - 2.0)</label><input id="gen-speed" type="number" value="1" min="0.5" max="2" step="0.05"></div>
+</div>
+<div class="hint">Stay near 1.0 for best clarity &amp; similarity.</div>
+<button id="btn-gen" onclick="doGenerate()">Generate speech</button>
+<div id="msg-gen" class="msg"></div>
+<audio id="player" controls style="display:none"></audio>
+</div>
+</div>
+
+<!-- VIDEO -->
+<div id="pane-video" style="display:none">
+<div class="card">
+<label>Voice</label><select id="vid-voice"><option value="">-- pick a saved voice --</option></select>
+<label>What should it say?</label><textarea id="vid-text" placeholder="Type your script..."></textarea>
+<div class="row2">
+<div><label>Speed (0.5 - 2.0)</label><input id="vid-speed" type="number" value="1" min="0.5" max="2" step="0.05"></div>
+<div style="max-width:220px"><label>Face / scene photo</label><input type="file" id="vid-image" accept="image/*"></div>
+</div>
+<div class="hint">Your photo gets a slow cinematic zoom while your cloned voice narrates. No photo? A dark gradient backdrop is used.</div>
+<label style="display:flex;align-items:center;gap:8px;text-transform:none;font-size:14px;color:var(--txt)">
+<input type="checkbox" id="vid-lipsync" style="width:auto"> Lip-sync mode &mdash; make the mouth move
+</label>
+<label>Quality</label>
+<select id="vid-quality">
+<option value="fast" selected>Fast &mdash; lip-sync only (minutes)</option>
+<option value="hq">HQ &mdash; lip-sync + face restore (very slow on CPU, ~45 min per 20s)</option>
+</select>
+<button id="btn-vid" onclick="doVideo()">Generate video</button>
+<div id="msg-vid" class="msg"></div>
+<video id="vid-player" controls style="display:none;width:100%;margin-top:14px;border-radius:8px"></video>
+</div>
+</div>
+
+<!-- SETTINGS -->
+<div id="pane-settings" style="display:none">
+<div class="card">
+<label>Venice API key</label>
+<input id="set-key" type="password" placeholder="paste your Venice API key">
+<div class="hint">Stored safely in your OS credential vault (Windows Credential Manager / macOS Keychain / Secret Service). Never written to disk files, never sent anywhere except api.venice.ai. <span id="key-status"></span></div>
+<button onclick="saveKey()">Save key</button>
+<button class="ghost" onclick="clearKey()">Remove key</button>
+<div id="msg-set" class="msg"></div>
+</div>
+</div>
+</div>
+<script>
+let pendingHandle=null;
+const $=id=>document.getElementById(id);
+function tab(t){document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('on',e.dataset.tab===t));
+['clone','voices','generate','video','settings'].forEach(p=>$('pane-'+p).style.display=p===t?'':'none');
+if(t==='voices'||t==='generate'||t==='video')loadVoices(); if(t==='settings')loadKeyStatus();}
+const vfTimers={};
+function msg(id,text,ok){if(vfTimers[id]){clearInterval(vfTimers[id]);delete vfTimers[id];}const e=$(id);e.textContent=text;e.className='msg '+(ok?'ok':'err');}
+function loading(id,text){
+ if(vfTimers[id])clearInterval(vfTimers[id]);
+ const e=$(id);e.className='msg ok';
+ const t0=Date.now();
+ const tick=()=>{const s=Math.floor((Date.now()-t0)/1000);const m=Math.floor(s/60),r=s%60;
+  e.innerHTML='<span class="spinner"></span>'+text+' <span class="elapsed">'+(m>0?m+'m ':'')+r+'s</span>';};
+ tick();vfTimers[id]=setInterval(tick,1000);
+}
+async function api(path,opt){const r=await fetch(path,opt);const j=await r.json().catch(()=>({error:r.statusText}));if(!r.ok)throw new Error(j.error||r.status);return j;}
+
+async function doClone(){
+ const url=$('yt-url').value.trim(), f=$('file-input').files[0];
+ if(!url&&!f){msg('msg-clone','Provide a YouTube link or choose an audio/video file.',false);return;}
+ $('btn-clone').disabled=true;$('btn-save').disabled=true;pendingHandle=null;
+ try{
+  let body;
+  if(f){body=new FormData();body.append('file',f);}else{body=new FormData();body.append('url',url);}
+  const s=$('trim-start').value,l=$('trim-len').value;
+  if(s)body.append('start',s); if(l)body.append('length',l);
+  loading('msg-clone','Downloading audio and creating the clone — this can take a minute.');
+  const j=await api('/api/clone',{method:'POST',body});
+  pendingHandle=j.voice_id;
+  msg('msg-clone','Voice cloned! Give it a name below and save it.',true);
+  $('btn-save').disabled=false;
+ }catch(e){msg('msg-clone',String(e.message||e),false);}
+ finally{$('btn-clone').disabled=false;}
+}
+async function saveVoice(){
+ const name=$('voice-name').value.trim();
+ if(!name){msg('msg-clone','Enter a name for the voice.',false);return;}
+ try{await api('/api/voices',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,voice_id:pendingHandle})});
+  msg('msg-clone','Saved as "'+name+'". Find it under My Voices.',true);
+  $('voice-name').value='';$('btn-save').disabled=true;pendingHandle=null;
+ }catch(e){msg('msg-clone',String(e.message||e),false);}
+}
+async function loadVoices(){
+ try{
+  const vs=await api('/api/voices');
+  const list=$('voice-list');list.innerHTML=vs.length?'':'<div class="hint">No voices yet.</div>';
+  vs.forEach(v=>{const d=document.createElement('div');d.className='voice-row';
+   d.innerHTML='<div><div class="voice-name"></div><div class="voice-id"></div></div>';
+   d.querySelector('.voice-name').textContent=v.name;
+   d.querySelector('.voice-id').textContent=v.voice_id.slice(0,24)+'...';
+   const btns=document.createElement('div');
+   const rn=document.createElement('button');rn.className='ghost';rn.style.cssText='padding:6px 10px;font-size:12px;margin-top:0';rn.textContent='Rename';
+   rn.onclick=async()=>{const n=prompt('New name:',v.name);if(n&&n.trim()){vs2=await api('/api/voices/'+v.id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n.trim()})});loadVoices();fillSelect(vs2);}};
+   const del=document.createElement('button');del.className='danger';del.textContent='Delete';
+   del.onclick=async()=>{if(confirm('Delete "'+v.name+'"?')){const j=await api('/api/voices/'+v.id,{method:'DELETE'});loadVoices();}};
+   btns.appendChild(rn);btns.appendChild(del);d.appendChild(btns);list.appendChild(d);});
+  fillSelect(vs);
+ }catch(e){console.log(e);}
+}
+function fillSelect(vs){const s=$('gen-voice');const cur=s.value;s.innerHTML='<option value="">-- pick a saved voice --</option>';
+ vs.forEach(v=>{const o=document.createElement('option');o.value=v.id;o.textContent=v.name;s.appendChild(o);});s.value=cur;
+ const s2=$('vid-voice');const cur2=s2.value;s2.innerHTML='<option value="">-- pick a saved voice --</option>';
+ vs.forEach(v=>{const o=document.createElement('option');o.value=v.id;o.textContent=v.name;s2.appendChild(o);});s2.value=cur2;}
+async function doGenerate(){
+ const vid=$('gen-voice').value,text=$('gen-text').value.trim(),speed=parseFloat($('gen-speed').value)||1;
+ if(!vid){msg('msg-gen','Pick a voice first.',false);return;}
+ if(!text){msg('msg-gen','Enter some text.',false);return;}
+ $('btn-gen').disabled=true;loading('msg-gen','Generating speech');
+ try{
+  const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({voice_id:vid,text:text,speed:speed})});
+  if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||r.status);}
+  const b=await r.blob();const p=$('player');p.src=URL.createObjectURL(b);p.style.display='block';p.play().catch(()=>{});
+  msg('msg-gen','Done!',true);
+ }catch(e){msg('msg-gen',String(e.message||e),false);}
+ finally{$('btn-gen').disabled=false;}
+}
+async function loadKeyStatus(){try{const j=await api('/api/settings/status');$('key-status').textContent=j.has_key?'A key is currently stored.':'';}catch(e){}}
+async function saveKey(){try{await api('/api/settings/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:$('set-key').value})});$('set-key').value='';msg('msg-set','API key saved securely.',true);loadKeyStatus();}catch(e){msg('msg-set',String(e.message||e),false);}}
+async function clearKey(){try{await api('/api/settings/key',{method:'DELETE'});msg('msg-set','Key removed.',true);loadKeyStatus();}catch(e){msg('msg-set',String(e.message||e),false);}}
+async function doVideo(){
+ const vid=$('vid-voice').value,text=$('vid-text').value.trim(),speed=parseFloat($('vid-speed').value)||1,img=$('vid-image').files[0];
+ if(!vid){msg('msg-vid','Pick a voice first.',false);return;}
+ if(!text){msg('msg-vid','Enter some text.',false);return;}
+ $('btn-vid').disabled=true;loading('msg-vid','Generating video' + ($('vid-lipsync')&&$('vid-lipsync').checked?' (lip-sync is working — keep this tab open)':''));
+ try{
+  const body=new FormData();body.append('voice_id',vid);body.append('text',text);body.append('speed',speed);
+  if(img)body.append('image',img);
+ if($('vid-lipsync') && $('vid-lipsync').checked)body.append('lipsync','1');
+ const q=$('vid-quality');if(q)body.append('quality',q.value||'fast');
+  const r=await fetch('/api/video',{method:'POST',body});
+  if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||r.status);}
+  const b=await r.blob();const p=$('vid-player');p.src=URL.createObjectURL(b);p.style.display='block';p.play().catch(()=>{});
+  msg('msg-vid','Done! Right-click the video to save it.',true);
+ }catch(e){msg('msg-vid',String(e.message||e),false);}
+ finally{$('btn-vid').disabled=false;}
+}
+async function loadCapabilities(){
+ try{
+  const c=await api('/api/capabilities'),box=$('vid-lipsync'),q=$('vid-quality');
+  if(box){box.disabled=!c.lipsync;box.title=c.lipsync?'Available on '+(c.torch.device||'CPU'):(c.lipsync_reason||'Optional lip-sync is not installed');}
+  if(q){q.disabled=!c.lipsync;if(!c.hq&&q.value==='hq')q.value='fast';}
+  if(!c.lipsync){const h=document.createElement('div');h.className='hint';h.textContent='Optional lip-sync is not installed. See docs/optional-lipsync.md.';$('vid-lipsync').parentElement.after(h);}
+ }catch(e){console.log(e);}
+}
+loadVoices();loadCapabilities();
+</script>
+</body>
+</html>

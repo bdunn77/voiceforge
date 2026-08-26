@@ -1,0 +1,6 @@
+librosa==0.10.2.post1
+opencv-python>=4.10,<5
+tqdm>=4.67,<5
+numba>=0.61
+scipy>=1.13
+gfpgan==1.3.8
