@@ -14,6 +14,9 @@ import sys
 import tempfile
 import time
 import uuid
+import signal
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import keyring
@@ -43,6 +46,12 @@ LS_GFP = os.path.join(LS_ROOT, "weights", "GFPGANv1.4.pth")
 os.makedirs(DATA_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD
+
+VIDEO_JOBS = {}
+VIDEO_JOBS_LOCK = threading.RLock()
+VIDEO_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voiceforge-video")
+VIDEO_TERMINAL = {"completed", "failed", "cancelled"}
+VIDEO_RESULT_TTL = 30 * 60
 
 
 # ---------------- helpers ----------------
@@ -130,8 +139,7 @@ def tool(name):
 def run(cmd, **kw):
     r = subprocess.run(cmd, capture_output=True, text=True, **kw)
     if r.returncode != 0:
-        tail = (r.stderr or "")[-800:]
-        raise RuntimeError("command failed: %s\n%s" % (" ".join(cmd[:4]), tail))
+        raise RuntimeError("A local media command failed. Verify ffmpeg/yt-dlp and the selected input.")
     return r
 
 
@@ -188,6 +196,11 @@ def venice_speech(voice_handle, text, speed=1.0):
 
 
 # ---------------- routes ----------------
+
+@app.get("/api/health")
+def health():
+    return jsonify({"app": "VoiceForge", "status": "ok", "version": "1.0.0"})
+
 
 @app.before_request
 def protect_local_mutations():
@@ -370,99 +383,278 @@ def generate():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _cleanup_video_jobs():
+    """Delete expired terminal job media; never retain private uploads indefinitely."""
+    cutoff = time.time() - VIDEO_RESULT_TTL
+    expired = []
+    with VIDEO_JOBS_LOCK:
+        for job_id, job in list(VIDEO_JOBS.items()):
+            if job.get("state") in VIDEO_TERMINAL and job.get("updated_at", 0) < cutoff:
+                expired.append((job_id, job.get("work_dir")))
+                VIDEO_JOBS.pop(job_id, None)
+    for _, work_dir in expired:
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _job_snapshot(job):
+    return {key: job.get(key) for key in (
+        "id", "state", "stage", "message", "progress", "created_at", "updated_at"
+    )} | {
+        "can_cancel": job.get("state") in {"queued", "running", "cancelling"},
+        "result_url": "/api/video/jobs/%s/result" % job["id"] if job.get("state") == "completed" else None,
+    }
+
+
+def _update_job(job, stage, message, progress=None, state=None):
+    with VIDEO_JOBS_LOCK:
+        if job["state"] in VIDEO_TERMINAL:
+            return
+        job["stage"] = stage
+        job["message"] = message
+        if progress is not None:
+            job["progress"] = max(job.get("progress", 0), min(99, float(progress)))
+        if state:
+            job["state"] = state
+        job["updated_at"] = int(time.time())
+
+
+def _cancel_process_tree(process):
+    if not process or process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           capture_output=True, timeout=15, shell=False)
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _check_cancel(job):
+    if job and job["cancel"].is_set():
+        raise InterruptedError("cancelled")
+
+
+def _run_video_process(job, cmd, timeout=900, cwd=None, env=None):
+    _check_cancel(job)
+    options = {"cwd": cwd, "env": env, "stdout": subprocess.PIPE,
+               "stderr": subprocess.PIPE, "text": True, "shell": False}
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True
+    process = subprocess.Popen(cmd, **options)
+    with VIDEO_JOBS_LOCK:
+        job["process"] = process
+    try:
+        started = time.time()
+        while process.poll() is None:
+            if job["cancel"].wait(0.25):
+                _cancel_process_tree(process)
+                raise InterruptedError("cancelled")
+            if time.time() - started > timeout:
+                _cancel_process_tree(process)
+                raise RuntimeError("A local video process timed out.")
+        stdout, stderr = process.communicate()
+        if process.returncode:
+            raise RuntimeError("A local video process failed. Try Fast quality or a shorter clip.")
+        return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+    finally:
+        with VIDEO_JOBS_LOCK:
+            if job.get("process") is process:
+                job["process"] = None
+
+
+def _render_video(row, text, speed, use_ls, use_hq, image_path, tmpdir, job=None):
+    img = os.path.join(tmpdir, "face.png")
+    if image_path:
+        shutil.copyfile(image_path, img)
+    elif not use_ls:
+        if job: _update_job(job, "backdrop", "Preparing video backdrop", 4)
+        _run_video_process(job, [tool("ffmpeg"), "-y", "-f", "lavfi", "-i",
+                            "gradients=s=1280x720:c0=#1a1033:c1=#0f1115:x0=0:y0=0:x1=1280:y1=720",
+                            "-frames:v", "1", img]) if job else run([
+                            tool("ffmpeg"), "-y", "-f", "lavfi", "-i",
+                            "gradients=s=1280x720:c0=#1a1033:c1=#0f1115:x0=0:y0=0:x1=1280:y1=720",
+                            "-frames:v", "1", img])
+    _check_cancel(job)
+    if job: _update_job(job, "speech", "Generating narration with Venice", 10)
+    wav, mp3 = os.path.join(tmpdir, "speech.wav"), os.path.join(tmpdir, "speech.mp3")
+    with open(wav, "wb") as f:
+        f.write(venice_speech(row["voice_id"], text, float(speed)))
+    _check_cancel(job)
+    if job: _update_job(job, "audio", "Preparing narration audio", 18)
+    cmd=[tool("ffmpeg"), "-y", "-i", wav, "-codec:a", "libmp3lame", "-q:a", "2", mp3]
+    _run_video_process(job, cmd) if job else run(cmd)
+    out = os.path.join(tmpdir, "out.mp4")
+    if use_ls:
+        if job: _update_job(job, "lipsync", "Animating the mouth to match speech", 25)
+        cmd=[sys.executable, os.path.join(LS_REPO, "inference.py"), "--checkpoint_path", LS_CKPT,
+             "--face", img, "--audio", wav, "--outfile", out]
+        _run_video_process(job, cmd, timeout=14400, cwd=LS_REPO) if job else run(cmd, timeout=14400, cwd=LS_REPO)
+        if job: _update_job(job, "lipsync", "Lip-sync complete", 70)
+        if use_hq:
+            if job: _update_job(job, "enhance", "Restoring facial detail frame by frame", 72)
+            enhanced=os.path.join(tmpdir,"out_enhanced.mp4"); env=os.environ.copy();env["VOICEFORGE_GFP_WEIGHTS"]=LS_GFP
+            cmd=[sys.executable,LS_ENHANCE,out,enhanced]
+            if job: _run_video_process(job,cmd,timeout=14400,cwd=BASE_DIR,env=env)
+            else:
+                result=subprocess.run(cmd,capture_output=True,text=True,timeout=14400,cwd=BASE_DIR,shell=False,env=env)
+                if result.returncode: raise RuntimeError("HQ face restoration failed; try Fast quality.")
+            out=enhanced
+            if job: _update_job(job,"enhance","Face restoration complete",94)
+    else:
+        if job: _update_job(job,"encode","Animating the photo and encoding video",35)
+        probe=run([tool("ffprobe"),"-v","error","-show_entries","format=duration","-of","csv=p=0",mp3])
+        duration=max(1.0,float(probe.stdout.strip()));frames=int(duration*25)+10
+        vf=("scale=1600:900:force_original_aspect_ratio=increase,crop=1600:900,"
+            "zoompan=z='min(zoom+0.0006,1.18)':d=%d:s=1280x720:fps=25,format=yuv420p"%frames)
+        cmd=[tool("ffmpeg"),"-y","-loop","1","-i",img,"-i",mp3,"-vf",vf,"-map","0:v","-map","1:a",
+             "-c:v","libx264","-preset","medium","-crf","21","-c:a","aac","-b:a","192k","-shortest",out]
+        _run_video_process(job,cmd,timeout=900) if job else run(cmd,timeout=900)
+    _check_cancel(job)
+    if not os.path.isfile(out) or os.path.getsize(out) == 0:
+        raise RuntimeError("Video encoding did not produce a valid file.")
+    return out
+
+
+ALLOWED_IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp"}
+
+
+def _save_video_image(upload, destination):
+    if not upload or (upload.mimetype or "").lower() not in ALLOWED_IMAGE_MIMES:
+        raise ValueError("Face image must be a JPEG, PNG, or WebP file.")
+    upload.save(destination)
+    if not os.path.isfile(destination) or os.path.getsize(destination) == 0:
+        raise ValueError("Face image is empty.")
+    # Decode/probe before passing untrusted input to the heavier ML pipeline.
+    try:
+        run([tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", destination], timeout=30)
+    except Exception as exc:
+        raise ValueError("Face image could not be decoded.") from exc
+
+
+def _video_inputs(form, files):
+    local_id=(form.get("voice_id") or "").strip(); text=(form.get("text") or "").strip()
+    if not local_id or not text: raise ValueError("'voice_id' and 'text' are both required.")
+    if len(text)>MAX_TEXT: raise ValueError("Text is too long (5000 characters maximum).")
+    row=next((v for v in load_voices() if v["id"]==local_id),None)
+    if not row: raise LookupError("Unknown voice.")
+    use_ls=(form.get("lipsync") or "")=="1";use_hq=(form.get("quality") or "fast").lower()=="hq"
+    caps=capabilities()
+    if use_ls and not caps["lipsync"]: raise RuntimeError("LIPSYNC_UNAVAILABLE")
+    if use_ls and use_hq and not caps["hq"]: raise RuntimeError("HQ_UNAVAILABLE")
+    if use_ls and not files.get("image"): raise ValueError("Lip-sync mode needs a face photo.")
+    return row,text,form.get("speed","1"),use_ls,use_hq
+
+
 @app.post("/api/video")
 def make_video():
-    """HeyGen-style talking video from a cloned voice.
-    Multipart: voice_id, text, speed, optional image file, optional lipsync=1.
-    lipsync=1 runs local Wav2Lip so the mouth moves; otherwise the photo gets
-    a slow cinematic zoom while the voice narrates."""
-    tmpdir = tempfile.mkdtemp(prefix="voiceforge_vid_")
+    """Compatibility synchronous video endpoint."""
+    tmpdir=tempfile.mkdtemp(prefix="voiceforge_vid_")
     try:
-        vid = ((request.form.get("voice_id") or "").strip())
-        text = ((request.form.get("text") or "").strip())
-        speed = request.form.get("speed", "1")
-        use_ls = (request.form.get("lipsync") or "") == "1"
-        quality = ((request.form.get("quality") or "fast").strip().lower())
-        use_hq = quality in ("hq", "high", "1", "true")
-        if not vid or not text:
-            return fail("'voice_id' and 'text' are both required.")
-        if len(text) > MAX_TEXT:
-            return fail("Text is too long (5000 characters maximum).")
-        row = next((v for v in load_voices() if v["id"] == vid), None)
-        if not row:
-            return fail("Unknown voice.", 404)
-
-        img = os.path.join(tmpdir, "face.png")
+        row,text,speed,use_ls,use_hq=_video_inputs(request.form,request.files)
+        image_path=None
         if request.files.get("image"):
-            request.files["image"].save(img)
-        elif not use_ls:
-            # neutral gradient backdrop if no photo supplied
-            run([tool("ffmpeg"), "-y", "-f", "lavfi",
-                 "-i", "gradients=s=1280x720:c0=#1a1033:c1=#0f1115:x0=0:y0=0:x1=1280:y1=720",
-                 "-frames:v", "1", img])
+            image_path=os.path.join(tmpdir,"upload.image");_save_video_image(request.files["image"],image_path)
+        out=_render_video(row,text,speed,use_ls,use_hq,image_path,tmpdir)
+        return send_file(io.BytesIO(open(out,"rb").read()),mimetype="video/mp4",download_name="voiceforge_video.mp4")
+    except LookupError as exc: return fail(str(exc),404)
+    except ValueError as exc: return fail(str(exc),400)
+    except RuntimeError as exc:
+        if str(exc) in {"LIPSYNC_UNAVAILABLE","HQ_UNAVAILABLE"}: return fail("Optional video component is not installed.",503)
+        return fail(str(exc),500)
+    finally: shutil.rmtree(tmpdir,ignore_errors=True)
 
-        caps = capabilities()
-        if use_ls and not caps["lipsync"]:
-            return fail("Lip-sync is optional and not installed. Run scripts/setup_lipsync.py first.", 503)
-        if use_ls and use_hq and not caps["hq"]:
-            return fail("HQ restoration is not installed. Re-run optional lip-sync setup.", 503)
-        if use_ls and not request.files.get("image"):
-            return fail("Lip-sync mode needs a face photo.")
 
-        # 1) narration -> wav -> mp3
-        wav = os.path.join(tmpdir, "speech.wav")
-        mp3 = os.path.join(tmpdir, "speech.mp3")
-        with open(wav, "wb") as f:
-            f.write(venice_speech(row["voice_id"], text, float(speed)))
-        run([tool("ffmpeg"), "-y", "-i", wav,
-             "-codec:a", "libmp3lame", "-q:a", "2", mp3])
+def _video_job_worker(job,row,text,speed,use_ls,use_hq,image_path):
+    try:
+        _update_job(job,"starting","Starting video render",1,state="running")
+        out=_render_video(row,text,speed,use_ls,use_hq,image_path,job["work_dir"],job)
+        final=os.path.join(job["work_dir"],"result.mp4")
+        if os.path.abspath(out)!=os.path.abspath(final): shutil.copyfile(out,final)
+        with VIDEO_JOBS_LOCK:
+            if job["cancel"].is_set(): raise InterruptedError("cancelled")
+            job.update(state="completed",stage="complete",message="Video ready",progress=100,
+                       result_path=final,updated_at=int(time.time()))
+    except InterruptedError:
+        with VIDEO_JOBS_LOCK: job.update(state="cancelled",stage="cancelled",message="Render cancelled",updated_at=int(time.time()))
+        shutil.rmtree(job["work_dir"],ignore_errors=True)
+    except Exception as exc:
+        print("video job failed:",type(exc).__name__,file=sys.stderr)
+        with VIDEO_JOBS_LOCK: job.update(state="failed",stage="failed",message="Video rendering failed. Try Fast quality or a shorter clip.",updated_at=int(time.time()))
+        shutil.rmtree(job["work_dir"],ignore_errors=True)
 
-        out = os.path.join(tmpdir, "out.mp4")
-        if use_ls:
-            # 2) Wav2Lip regenerates the mouth region frame-by-frame
-            #    (temporal smoothing enabled by omitting --nosmooth)
-            run([sys.executable, os.path.join(LS_REPO, "inference.py"),
-                 "--checkpoint_path", LS_CKPT,
-                 "--face", img, "--audio", wav,
-                 "--outfile", out],
-                timeout=14400, cwd=LS_REPO)
-            # 3) GFPGAN face restoration pass -> sharper, more realistic mouth
-            if use_hq and os.path.exists(LS_GFP):
-                enhanced = os.path.join(tmpdir, "out_enhanced.mp4")
-                env = os.environ.copy()
-                env["VOICEFORGE_GFP_WEIGHTS"] = LS_GFP
-                r = subprocess.run([sys.executable, LS_ENHANCE, out, enhanced], capture_output=True,
-                                   text=True, timeout=14400, cwd=BASE_DIR, shell=False, env=env)
-                if r.returncode != 0:
-                    raise RuntimeError("HQ face restoration failed; try Fast quality.")
-                out = enhanced
-        else:
-            # 2) measure audio duration -> frame count at 25 fps
-            pr = run([tool("ffprobe"), "-v", "error", "-show_entries", "format=duration",
-                      "-of", "csv=p=0", mp3])
-            dur = max(1.0, float(pr.stdout.strip()))
-            frames = int(dur * 25) + 10
 
-            # 3) animate photo (slow zoom-in) + mux narration -> mp4
-            vf = ("scale=1600:900:force_original_aspect_ratio=increase,crop=1600:900,"
-                  "zoompan=z='min(zoom+0.0006,1.18)':d=%d:s=1280x720:fps=25,"
-                  "format=yuv420p" % frames)
-            run([tool("ffmpeg"), "-y", "-loop", "1", "-i", img, "-i", mp3,
-                 "-vf", vf,
-                 "-map", "0:v", "-map", "1:a",
-                 "-c:v", "libx264", "-preset", "medium", "-crf", "21",
-                 "-c:a", "aac", "-b:a", "192k", "-shortest", out], timeout=600)
+@app.post("/api/video/jobs")
+def create_video_job():
+    _cleanup_video_jobs()
+    with VIDEO_JOBS_LOCK:
+        active=[j for j in VIDEO_JOBS.values() if j["state"] not in VIDEO_TERMINAL]
+        if active: return fail("Another video is already rendering. Cancel it or wait for it to finish.",409)
+    work=tempfile.mkdtemp(prefix="voiceforge_video_job_")
+    try:
+        row,text,speed,use_ls,use_hq=_video_inputs(request.form,request.files)
+        image_path=None
+        if request.files.get("image"):
+            image_path=os.path.join(work,"upload.image");_save_video_image(request.files["image"],image_path)
+        now=int(time.time());job_id=uuid.uuid4().hex
+        job={"id":job_id,"state":"queued","stage":"queued","message":"Queued","progress":0,
+             "created_at":now,"updated_at":now,"cancel":threading.Event(),"process":None,
+             "work_dir":work,"result_path":None}
+        with VIDEO_JOBS_LOCK: VIDEO_JOBS[job_id]=job
+        VIDEO_EXECUTOR.submit(_video_job_worker,job,row,text,speed,use_ls,use_hq,image_path)
+        response=jsonify(_job_snapshot(job));response.status_code=202;response.headers["Cache-Control"]="no-store";return response
+    except LookupError as exc: shutil.rmtree(work,ignore_errors=True);return fail(str(exc),404)
+    except ValueError as exc: shutil.rmtree(work,ignore_errors=True);return fail(str(exc),400)
+    except RuntimeError as exc:
+        shutil.rmtree(work,ignore_errors=True)
+        if str(exc) in {"LIPSYNC_UNAVAILABLE","HQ_UNAVAILABLE"}: return fail("Optional video component is not installed.",503)
+        return fail("Could not create video job.",500)
 
-        with open(out, "rb") as f:
-            buf = io.BytesIO(f.read())
-        return send_file(buf, mimetype="video/mp4",
-                         download_name="voiceforge_video.mp4")
-    except Exception as e:
-        return fail(str(e), 500)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+
+@app.get("/api/video/jobs/<job_id>")
+def video_job_status(job_id):
+    _cleanup_video_jobs()
+    with VIDEO_JOBS_LOCK:
+        job=VIDEO_JOBS.get(job_id)
+        if not job: return fail("Unknown or expired video job.",404)
+        response=jsonify(_job_snapshot(job));response.headers["Cache-Control"]="no-store";return response
+
+
+@app.post("/api/video/jobs/<job_id>/cancel")
+def cancel_video_job(job_id):
+    with VIDEO_JOBS_LOCK:
+        job=VIDEO_JOBS.get(job_id)
+        if not job: return fail("Unknown or expired video job.",404)
+        if job["state"] in VIDEO_TERMINAL: return jsonify(_job_snapshot(job))
+        if job["state"] == "cancelling":
+            response = jsonify(_job_snapshot(job)); response.status_code = 202; return response
+        job["cancel"].set();job["state"]="cancelling";job["message"]="Cancelling render";process=job.get("process")
+    _cancel_process_tree(process)
+    response=jsonify(_job_snapshot(job));response.status_code=202;response.headers["Cache-Control"]="no-store";return response
+
+
+@app.get("/api/video/jobs/<job_id>/result")
+def video_job_result(job_id):
+    with VIDEO_JOBS_LOCK:
+        job=VIDEO_JOBS.get(job_id)
+        if not job: return fail("Unknown or expired video job.",404)
+        if job["state"]!="completed": return fail("Video is not ready.",409)
+        path=job.get("result_path")
+    if not path or not os.path.isfile(path): return fail("Video result expired.",410)
+    response=send_file(path,mimetype="video/mp4",as_attachment=True,download_name="voiceforge_video.mp4")
+    response.headers["Cache-Control"]="no-store"
+    return response
 
 
 if __name__ == "__main__":
     print("VoiceForge running at http://127.0.0.1:8765")
-    app.run(host="127.0.0.1", port=8765, debug=False)
+    app.run(host="127.0.0.1", port=8765, debug=False, threaded=True)
