@@ -26,6 +26,7 @@ button.danger{background:transparent;border:1px solid var(--err);color:var(--err
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.25);border-top-color:var(--acc);border-radius:50%;animation:vfspin .8s linear infinite;margin-right:8px;vertical-align:-2px}
 @keyframes vfspin{to{transform:rotate(360deg)}}
 .elapsed{color:var(--dim);font-size:12px;margin-left:6px}
+.progress{height:10px;background:#0b0d11;border:1px solid var(--line);border-radius:999px;overflow:hidden;margin-top:12px}.progress>div{height:100%;width:0;background:linear-gradient(90deg,var(--acc),#22c55e);transition:width .35s ease}.progress-label{font-size:12px;color:var(--dim);margin-top:6px}
 .voice-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px;background:#12151a}
 .voice-name{font-weight:600}.voice-id{font-size:11px;color:var(--dim);font-family:monospace}
 select{width:100%;background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:10px;color:var(--txt)}
@@ -111,6 +112,9 @@ audio{width:100%;margin-top:14px}
 <option value="hq">HQ &mdash; lip-sync + face restore (very slow on CPU, ~45 min per 20s)</option>
 </select>
 <button id="btn-vid" onclick="doVideo()">Generate video</button>
+<button id="btn-cancel-vid" class="danger" onclick="cancelVideo()" style="display:none;margin-left:8px">Cancel render</button>
+<div id="vid-progress" class="progress" style="display:none"><div></div></div>
+<div id="vid-progress-label" class="progress-label" style="display:none"></div>
 <div id="msg-vid" class="msg"></div>
 <video id="vid-player" controls style="display:none;width:100%;margin-top:14px;border-radius:8px"></video>
 </div>
@@ -208,22 +212,56 @@ async function doGenerate(){
 async function loadKeyStatus(){try{const j=await api('/api/settings/status');$('key-status').textContent=j.has_key?'A key is currently stored.':'';}catch(e){}}
 async function saveKey(){try{await api('/api/settings/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:$('set-key').value})});$('set-key').value='';msg('msg-set','API key saved securely.',true);loadKeyStatus();}catch(e){msg('msg-set',String(e.message||e),false);}}
 async function clearKey(){try{await api('/api/settings/key',{method:'DELETE'});msg('msg-set','Key removed.',true);loadKeyStatus();}catch(e){msg('msg-set',String(e.message||e),false);}}
+let activeVideoJob=null,videoPollTimer=null,videoObjectUrl=null;
+function setVideoProgress(value,label){
+ const box=$('vid-progress'),txt=$('vid-progress-label');box.style.display='block';txt.style.display='block';
+ box.firstElementChild.style.width=Math.max(0,Math.min(100,value||0))+'%';txt.textContent=label||'';
+}
+function finishVideoUI(){
+ sessionStorage.removeItem('voiceforgeVideoJob');
+ if(videoPollTimer){clearTimeout(videoPollTimer);videoPollTimer=null;}
+ $('btn-vid').disabled=false;$('btn-cancel-vid').style.display='none';activeVideoJob=null;
+}
+async function pollVideoJob(){
+ if(!activeVideoJob)return;
+ try{
+  const j=await api('/api/video/jobs/'+activeVideoJob);
+  setVideoProgress(j.progress||0,(j.message||j.stage)+' — '+Math.round(j.progress||0)+'%');
+  if(j.state==='completed'){
+   const r=await fetch(j.result_url);if(!r.ok)throw new Error('Could not download completed video.');
+   const b=await r.blob();if(videoObjectUrl)URL.revokeObjectURL(videoObjectUrl);videoObjectUrl=URL.createObjectURL(b);
+   const player=$('vid-player');player.src=videoObjectUrl;player.style.display='block';player.play().catch(()=>{});
+   msg('msg-vid','Done! Right-click the video to save it.',true);finishVideoUI();return;
+  }
+  if(j.state==='failed'){msg('msg-vid',j.message||'Video rendering failed.',false);finishVideoUI();return;}
+  if(j.state==='cancelled'){msg('msg-vid','Video render cancelled.',true);finishVideoUI();return;}
+  videoPollTimer=setTimeout(pollVideoJob,document.hidden?2500:900);
+ }catch(e){
+  const detail=String(e.message||e);
+  if(detail.includes('Unknown or expired video job')){
+   msg('msg-vid','The previous video job expired. Start a new render.',false);finishVideoUI();return;
+  }
+  setVideoProgress(0,'Temporarily unable to read progress; retrying…');
+  videoPollTimer=setTimeout(pollVideoJob,2500);
+ }
+}
 async function doVideo(){
  const vid=$('vid-voice').value,text=$('vid-text').value.trim(),speed=parseFloat($('vid-speed').value)||1,img=$('vid-image').files[0];
  if(!vid){msg('msg-vid','Pick a voice first.',false);return;}
  if(!text){msg('msg-vid','Enter some text.',false);return;}
- $('btn-vid').disabled=true;loading('msg-vid','Generating video' + ($('vid-lipsync')&&$('vid-lipsync').checked?' (lip-sync is working — keep this tab open)':''));
+ $('btn-vid').disabled=true;$('btn-cancel-vid').style.display='inline-block';$('btn-cancel-vid').disabled=false;
+ setVideoProgress(0,'Submitting video job…');loading('msg-vid','Starting video render');
  try{
   const body=new FormData();body.append('voice_id',vid);body.append('text',text);body.append('speed',speed);
-  if(img)body.append('image',img);
- if($('vid-lipsync') && $('vid-lipsync').checked)body.append('lipsync','1');
- const q=$('vid-quality');if(q)body.append('quality',q.value||'fast');
-  const r=await fetch('/api/video',{method:'POST',body});
-  if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||r.status);}
-  const b=await r.blob();const p=$('vid-player');p.src=URL.createObjectURL(b);p.style.display='block';p.play().catch(()=>{});
-  msg('msg-vid','Done! Right-click the video to save it.',true);
- }catch(e){msg('msg-vid',String(e.message||e),false);}
- finally{$('btn-vid').disabled=false;}
+  if(img)body.append('image',img);if($('vid-lipsync').checked)body.append('lipsync','1');body.append('quality',$('vid-quality').value||'fast');
+  const j=await api('/api/video/jobs',{method:'POST',body});activeVideoJob=j.id;sessionStorage.setItem('voiceforgeVideoJob',j.id);
+  pollVideoJob();
+ }catch(e){msg('msg-vid',String(e.message||e),false);finishVideoUI();}
+}
+async function cancelVideo(){
+ if(!activeVideoJob)return;$('btn-cancel-vid').disabled=true;$('btn-cancel-vid').textContent='Cancelling…';
+ try{await api('/api/video/jobs/'+activeVideoJob+'/cancel',{method:'POST'});}catch(e){msg('msg-vid',String(e.message||e),false);}
+ finally{$('btn-cancel-vid').textContent='Cancel render';}
 }
 async function loadCapabilities(){
  try{
@@ -234,6 +272,7 @@ async function loadCapabilities(){
  }catch(e){console.log(e);}
 }
 loadVoices();loadCapabilities();
+const remembered=sessionStorage.getItem('voiceforgeVideoJob');if(remembered){activeVideoJob=remembered;$('btn-vid').disabled=true;$('btn-cancel-vid').style.display='inline-block';pollVideoJob();}
 </script>
 </body>
 </html>
