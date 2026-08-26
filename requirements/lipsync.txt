@@ -1,5 +1,5 @@
 librosa==0.10.2.post1
-opencv-python>=4.10,<5
+opencv-python>=5.0.0.93,<6
 tqdm>=4.67,<5
 numba>=0.61
 scipy>=1.13
