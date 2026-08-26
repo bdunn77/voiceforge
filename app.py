@@ -136,8 +136,20 @@ def tool(name):
     return p
 
 
+def _silent_kw(kw):
+    """On Windows, launch child console tools without flashing a terminal window."""
+    if os.name == "nt":
+        kw = dict(kw)
+        kw["creationflags"] = kw.get("creationflags", 0) | subprocess.CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        kw.setdefault("startupinfo", si)
+    return kw
+
+
 def run(cmd, **kw):
-    r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    r = subprocess.run(cmd, capture_output=True, text=True, **_silent_kw(kw))
     if r.returncode != 0:
         raise RuntimeError("A local media command failed. Verify ffmpeg/yt-dlp and the selected input.")
     return r
@@ -199,7 +211,7 @@ def venice_speech(voice_handle, text, speed=1.0):
 
 @app.get("/api/health")
 def health():
-    return jsonify({"app": "VoiceForge", "status": "ok", "version": "1.0.0"})
+    return jsonify({"app": "VoiceForge", "status": "ok", "version": "1.0.1"})
 
 
 @app.before_request
@@ -446,7 +458,12 @@ def _run_video_process(job, cmd, timeout=900, cwd=None, env=None):
     options = {"cwd": cwd, "env": env, "stdout": subprocess.PIPE,
                "stderr": subprocess.PIPE, "text": True, "shell": False}
     if os.name == "nt":
-        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        options["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                    | subprocess.CREATE_NO_WINDOW)
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        options["startupinfo"] = si
     else:
         options["start_new_session"] = True
     process = subprocess.Popen(cmd, **options)
@@ -505,7 +522,7 @@ def _render_video(row, text, speed, use_ls, use_hq, image_path, tmpdir, job=None
             cmd=[sys.executable,LS_ENHANCE,out,enhanced]
             if job: _run_video_process(job,cmd,timeout=14400,cwd=BASE_DIR,env=env)
             else:
-                result=subprocess.run(cmd,capture_output=True,text=True,timeout=14400,cwd=BASE_DIR,shell=False,env=env)
+                result=subprocess.run(cmd,capture_output=True,text=True,timeout=14400,cwd=BASE_DIR,shell=False,env=env,**_silent_kw({}))
                 if result.returncode: raise RuntimeError("HQ face restoration failed; try Fast quality.")
             out=enhanced
             if job: _update_job(job,"enhance","Face restoration complete",94)
