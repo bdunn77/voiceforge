@@ -9,6 +9,7 @@ import app as vf
 def setup_function():
     with vf.VIDEO_JOBS_LOCK:
         vf.VIDEO_JOBS.clear()
+    vf.VIDEO_RENDER_GATE = threading.BoundedSemaphore(1)
 
 
 def _voice(monkeypatch):
@@ -170,3 +171,62 @@ def test_lipsync_launch_uses_resolved_python(monkeypatch, tmp_path):
     lipsync=[call for call in calls if "inference.py" in call[0][1]][0]
     assert lipsync[0][0]=="console-python.exe"
     assert lipsync[1]["cwd"]==vf.LS_REPO
+
+
+def test_render_lease_release_is_idempotent():
+    lease=vf._try_reserve_render()
+    assert lease is not None and vf._try_reserve_render() is None
+    lease.release();lease.release()
+    next_lease=vf._try_reserve_render()
+    assert next_lease is not None
+    next_lease.release()
+
+
+def test_sync_render_rejects_when_gate_is_held():
+    lease=vf._try_reserve_render()
+    try:
+        response=vf.app.test_client().post('/api/video',data={})
+        assert response.status_code==409
+    finally:
+        lease.release()
+
+
+def test_async_render_rejects_when_gate_is_held(monkeypatch):
+    _voice(monkeypatch)
+    lease=vf._try_reserve_render()
+    try:
+        response=vf.app.test_client().post('/api/video/jobs',data={"voice_id":"local1","text":"hello"})
+        assert response.status_code==409
+    finally:
+        lease.release()
+
+
+def test_sync_validation_failure_releases_gate():
+    response=vf.app.test_client().post('/api/video',data={})
+    assert response.status_code==400
+    lease=vf._try_reserve_render()
+    assert lease is not None
+    lease.release()
+
+
+def test_async_submit_failure_releases_gate_and_removes_job(monkeypatch):
+    _voice(monkeypatch)
+    monkeypatch.setattr(vf.VIDEO_EXECUTOR,"submit",lambda *a,**k: (_ for _ in ()).throw(RuntimeError("submit failed")))
+    response=vf.app.test_client().post('/api/video/jobs',data={"voice_id":"local1","text":"hello"})
+    assert response.status_code==500
+    assert not vf.VIDEO_JOBS
+    lease=vf._try_reserve_render()
+    assert lease is not None
+    lease.release()
+
+
+def test_async_worker_releases_gate_on_failure(tmp_path):
+    lease=vf._try_reserve_render()
+    job={"id":"worker","state":"queued","stage":"queued","message":"Queued","progress":0,
+         "created_at":1,"updated_at":1,"cancel":threading.Event(),"process":None,
+         "work_dir":str(tmp_path),"result_path":None}
+    vf._video_job_worker(job,{},"text","1",False,False,None,lease)
+    assert job["state"]=="failed"
+    next_lease=vf._try_reserve_render()
+    assert next_lease is not None
+    next_lease.release()
