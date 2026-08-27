@@ -34,3 +34,16 @@ def test_corrupt_voice_file_is_preserved(client):
 def test_cross_origin_mutation_rejected(client):
  result=client.post('/api/settings/key',json={'api_key':'x'*30},headers={'Origin':'https://evil.example'})
  assert result.status_code==403
+
+
+def test_shutdown_endpoint(client, monkeypatch):
+    killed=[]
+    monkeypatch.setattr(m.os,'_exit',lambda code: killed.append(code))
+    class FakeThread:
+        def __init__(self,target=None,daemon=None):self.target=target
+        def start(self):pass  # never actually exit during tests
+    monkeypatch.setattr(m.threading,'Thread',FakeThread)
+    result=client.post('/api/shutdown')
+    assert result.status_code==200
+    assert result.get_json()['ok'] is True
+    assert killed==[]  # exit deferred to a daemon thread, not run inline

@@ -128,6 +128,9 @@ audio{width:100%;margin-top:14px}
 <div class="hint">Stored safely in your OS credential vault (Windows Credential Manager / macOS Keychain / Secret Service). Never written to disk files, never sent anywhere except api.venice.ai. <span id="key-status"></span></div>
 <button onclick="saveKey()">Save key</button>
 <button class="ghost" onclick="clearKey()">Remove key</button>
+<hr style="border-color:var(--line);margin:16px 0">
+<button class="danger" onclick="quitApp()">Quit VoiceForge</button>
+<div class="hint">Fully stops the background server so nothing keeps running after you are done.</div>
 <div id="msg-set" class="msg"></div>
 </div>
 </div>
@@ -211,6 +214,11 @@ async function doGenerate(){
 }
 async function loadKeyStatus(){try{const j=await api('/api/settings/status');$('key-status').textContent=j.has_key?'A key is currently stored.':'';}catch(e){}}
 async function saveKey(){try{await api('/api/settings/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:$('set-key').value})});$('set-key').value='';msg('msg-set','API key saved securely.',true);loadKeyStatus();}catch(e){msg('msg-set',String(e.message||e),false);}}
+async function quitApp(){
+ if(!confirm('Quit VoiceForge completely? Any active render will be stopped.'))return;
+ try{await fetch('/api/shutdown',{method:'POST'});}catch(e){}
+ document.body.innerHTML='<div style="max-width:420px;margin:120px auto;text-align:center;font-family:sans-serif"><h2>VoiceForge stopped</h2><p>The background server has exited. Nothing is running or consuming resources. You can close this tab.</p></div>';
+}
 async function clearKey(){try{await api('/api/settings/key',{method:'DELETE'});msg('msg-set','Key removed.',true);loadKeyStatus();}catch(e){msg('msg-set',String(e.message||e),false);}}
 let activeVideoJob=null,videoPollTimer=null,videoObjectUrl=null;
 function setVideoProgress(value,label){
