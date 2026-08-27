@@ -50,6 +50,7 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD
 VIDEO_JOBS = {}
 VIDEO_JOBS_LOCK = threading.RLock()
 VIDEO_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voiceforge-video")
+VIDEO_RENDER_GATE = threading.BoundedSemaphore(1)
 VIDEO_TERMINAL = {"completed", "failed", "cancelled"}
 VIDEO_RESULT_TTL = 30 * 60
 
@@ -407,6 +408,25 @@ def generate():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class _RenderLease:
+    """An idempotently releasable reservation for the single video renderer."""
+    def __init__(self):
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self):
+        with self._lock:
+            if not self._released:
+                self._released = True
+                VIDEO_RENDER_GATE.release()
+
+
+def _try_reserve_render():
+    if not VIDEO_RENDER_GATE.acquire(blocking=False):
+        return None
+    return _RenderLease()
+
+
 def _cleanup_video_jobs():
     """Delete expired terminal job media; never retain private uploads indefinitely."""
     cutoff = time.time() - VIDEO_RESULT_TTL
@@ -587,8 +607,11 @@ def _video_inputs(form, files):
 @app.post("/api/video")
 def make_video():
     """Compatibility synchronous video endpoint."""
-    tmpdir=tempfile.mkdtemp(prefix="voiceforge_vid_")
+    lease=_try_reserve_render()
+    if lease is None: return fail("Another video is already rendering. Cancel it or wait for it to finish.",409)
+    tmpdir=None
     try:
+        tmpdir=tempfile.mkdtemp(prefix="voiceforge_vid_")
         row,text,speed,use_ls,use_hq=_video_inputs(request.form,request.files)
         image_path=None
         if request.files.get("image"):
@@ -600,10 +623,12 @@ def make_video():
     except RuntimeError as exc:
         if str(exc) in {"LIPSYNC_UNAVAILABLE","HQ_UNAVAILABLE"}: return fail("Optional video component is not installed.",503)
         return fail(str(exc),500)
-    finally: shutil.rmtree(tmpdir,ignore_errors=True)
+    finally:
+        if tmpdir: shutil.rmtree(tmpdir,ignore_errors=True)
+        lease.release()
 
 
-def _video_job_worker(job,row,text,speed,use_ls,use_hq,image_path):
+def _video_job_worker(job,row,text,speed,use_ls,use_hq,image_path,lease):
     try:
         _update_job(job,"starting","Starting video render",1,state="running")
         out=_render_video(row,text,speed,use_ls,use_hq,image_path,job["work_dir"],job)
@@ -620,16 +645,24 @@ def _video_job_worker(job,row,text,speed,use_ls,use_hq,image_path):
         print("video job failed:",type(exc).__name__,file=sys.stderr)
         with VIDEO_JOBS_LOCK: job.update(state="failed",stage="failed",message="Video rendering failed. Try Fast quality or a shorter clip.",updated_at=int(time.time()))
         shutil.rmtree(job["work_dir"],ignore_errors=True)
+    finally:
+        lease.release()
 
 
 @app.post("/api/video/jobs")
 def create_video_job():
     _cleanup_video_jobs()
+    lease=_try_reserve_render()
+    if lease is None: return fail("Another video is already rendering. Cancel it or wait for it to finish.",409)
     with VIDEO_JOBS_LOCK:
-        active=[j for j in VIDEO_JOBS.values() if j["state"] not in VIDEO_TERMINAL]
-        if active: return fail("Another video is already rendering. Cancel it or wait for it to finish.",409)
-    work=tempfile.mkdtemp(prefix="voiceforge_video_job_")
+        active=any(job["state"] not in VIDEO_TERMINAL for job in VIDEO_JOBS.values())
+    if active:
+        lease.release()
+        return fail("Another video is already rendering. Cancel it or wait for it to finish.",409)
+    handed_to_worker=False
+    work=None
     try:
+        work=tempfile.mkdtemp(prefix="voiceforge_video_job_")
         row,text,speed,use_ls,use_hq=_video_inputs(request.form,request.files)
         image_path=None
         if request.files.get("image"):
@@ -639,14 +672,25 @@ def create_video_job():
              "created_at":now,"updated_at":now,"cancel":threading.Event(),"process":None,
              "work_dir":work,"result_path":None}
         with VIDEO_JOBS_LOCK: VIDEO_JOBS[job_id]=job
-        VIDEO_EXECUTOR.submit(_video_job_worker,job,row,text,speed,use_ls,use_hq,image_path)
+        try:
+            VIDEO_EXECUTOR.submit(_video_job_worker,job,row,text,speed,use_ls,use_hq,image_path,lease)
+        except Exception:
+            with VIDEO_JOBS_LOCK: VIDEO_JOBS.pop(job_id,None)
+            raise
+        handed_to_worker=True
         response=jsonify(_job_snapshot(job));response.status_code=202;response.headers["Cache-Control"]="no-store";return response
-    except LookupError as exc: shutil.rmtree(work,ignore_errors=True);return fail(str(exc),404)
-    except ValueError as exc: shutil.rmtree(work,ignore_errors=True);return fail(str(exc),400)
+    except LookupError as exc:
+        if work: shutil.rmtree(work,ignore_errors=True)
+        return fail(str(exc),404)
+    except ValueError as exc:
+        if work: shutil.rmtree(work,ignore_errors=True)
+        return fail(str(exc),400)
     except RuntimeError as exc:
-        shutil.rmtree(work,ignore_errors=True)
+        if work: shutil.rmtree(work,ignore_errors=True)
         if str(exc) in {"LIPSYNC_UNAVAILABLE","HQ_UNAVAILABLE"}: return fail("Optional video component is not installed.",503)
         return fail("Could not create video job.",500)
+    finally:
+        if not handed_to_worker: lease.release()
 
 
 @app.get("/api/video/jobs/<job_id>")
