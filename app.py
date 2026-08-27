@@ -224,7 +224,17 @@ def venice_speech(voice_handle, text, speed=1.0):
 
 @app.get("/api/health")
 def health():
-    return jsonify({"app": "VoiceForge", "status": "ok", "version": "1.0.1"})
+    return jsonify({"app": "VoiceForge", "status": "ok", "version": "1.0.2"})
+
+
+@app.post("/api/shutdown")
+def shutdown():
+    """Let the local user fully exit the background server from the UI."""
+    def _die():
+        time.sleep(0.8)
+        os._exit(0)
+    threading.Thread(target=_die, daemon=True).start()
+    return jsonify({"ok": True, "message": "VoiceForge is shutting down."})
 
 
 @app.before_request

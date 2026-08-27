@@ -2,6 +2,11 @@
 
 All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.2] - 2026-08-27
+
+### Added
+- "Quit VoiceForge" button in Settings and a loopback-only `POST /api/shutdown` endpoint, so users can fully stop the background server (and any active render) from the UI.
+
 ## [1.0.1] - 2026-08-26
 
 ### Fixed
