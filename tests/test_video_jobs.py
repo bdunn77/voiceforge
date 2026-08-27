@@ -230,3 +230,20 @@ def test_async_worker_releases_gate_on_failure(tmp_path):
     next_lease=vf._try_reserve_render()
     assert next_lease is not None
     next_lease.release()
+
+
+def test_lipsync_photo_is_bounded_before_inference(monkeypatch, tmp_path):
+    image=tmp_path/"upload.png";image.write_bytes(b"large portrait")
+    calls=[]
+    monkeypatch.setattr(vf,"_python_tool_executable",lambda:"console-python.exe")
+    monkeypatch.setattr(vf,"venice_speech",lambda *a:b"wave")
+    monkeypatch.setattr(vf,"tool",lambda name:name)
+    monkeypatch.setattr(vf,"run",lambda cmd,**kw:calls.append((cmd,kw)) or vf.subprocess.CompletedProcess(cmd,0,"",""))
+    monkeypatch.setattr(vf.os.path,"isfile",lambda path: path.endswith("out.mp4") or os.path.isfile(path))
+    monkeypatch.setattr(vf.os.path,"getsize",lambda path: 1)
+    vf._render_video({"voice_id":"voice"},"hello","1",True,False,str(image),str(tmp_path))
+    resize=next(cmd for cmd,_ in calls if cmd[0]=="ffmpeg" and "-vf" in cmd)
+    assert "min(1280,iw)" in resize[resize.index("-vf")+1]
+    assert "min(1280,ih)" in resize[resize.index("-vf")+1]
+    inference=next(cmd for cmd,_ in calls if len(cmd)>1 and "inference.py" in cmd[1])
+    assert inference[inference.index("--face")+1]==str(tmp_path/"face.png")
