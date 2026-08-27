@@ -523,7 +523,16 @@ def _run_video_process(job, cmd, timeout=900, cwd=None, env=None):
 def _render_video(row, text, speed, use_ls, use_hq, image_path, tmpdir, job=None):
     img = os.path.join(tmpdir, "face.png")
     if image_path:
-        shutil.copyfile(image_path, img)
+        if use_ls:
+            # Camera photos can exceed 15 MP. Wav2Lip's S3FD detector processes
+            # the full image and may consume all RAM/VRAM for hours, so bound
+            # both dimensions without enlarging smaller portraits.
+            cmd=[tool("ffmpeg"), "-y", "-i", image_path, "-vf",
+                 "scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease",
+                 "-frames:v", "1", img]
+            _run_video_process(job,cmd,timeout=120) if job else run(cmd,timeout=120)
+        else:
+            shutil.copyfile(image_path, img)
     elif not use_ls:
         if job: _update_job(job, "backdrop", "Preparing video backdrop", 4)
         _run_video_process(job, [tool("ffmpeg"), "-y", "-f", "lavfi", "-i",
